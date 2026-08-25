@@ -1,13 +1,15 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad
+from Crypto.Util.Padding import pad, unpad
 import requests
 import jwt
 import urllib3
 import base64
 import json
-from urllib.parse import urlparse, parse_qs
+import re
+import time
+from urllib.parse import urlparse, parse_qs, urljoin
 import my_pb2
 import output_pb2
 
@@ -51,6 +53,16 @@ def encrypt_message(plaintext):
     padded_message = pad(plaintext, AES.block_size)
     return cipher.encrypt(padded_message)
 
+def decrypt_message(ciphertext):
+    """Decrypt and unpad response data (matches main.py)."""
+    if len(ciphertext) % 16 != 0:
+        return ciphertext
+    try:
+        cipher = AES.new(AES_KEY, AES.MODE_CBC, AES_IV)
+        return unpad(cipher.decrypt(ciphertext), AES.block_size)
+    except:
+        return ciphertext
+
 def extract_eat_token(user_input):
     if "http" in user_input or "?" in user_input:
         parsed_url = urlparse(user_input)
@@ -61,170 +73,168 @@ def extract_eat_token(user_input):
     return user_input.strip()
 
 def get_access_token_from_eat(eat_token):
-    api_url = f"https://api-otrss.garena.com/support/callback/?access_token={eat_token}"
-    headers = {"User-Agent": "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 Chrome/114.0.0.0 Mobile"}
+    """Manually follow redirects to extract access_token (improved from main.py)."""
+    url = f"https://api-otrss.garena.com/support/callback/?access_token={eat_token}"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+    }
+    session = requests.Session()
+    resp = session.get(url, headers=headers, allow_redirects=False, verify=False, timeout=10)
+    redirect_count = 0
+    max_redirects = 10
+    while 300 <= resp.status_code < 400 and redirect_count < max_redirects:
+        location = resp.headers.get('location')
+        if not location:
+            break
+        next_url = location if location.startswith('http') else urljoin(url, location)
+        resp = session.get(next_url, headers=headers, allow_redirects=False, verify=False)
+        redirect_count += 1
+
+    final_url = resp.url
+    parsed = urlparse(final_url)
+    qs = parse_qs(parsed.query)
+    access_token = qs.get('access_token', [None])[0]
+    if access_token:
+        return access_token
+
+    # Try to parse JSON body
+    if resp.text:
+        try:
+            data = json.loads(resp.text)
+            access_token = data.get('access_token') or data.get('token')
+            if access_token:
+                return access_token
+        except:
+            pass
+        # Fallback: search for hex token in body
+        match = re.search(r'[a-fA-F0-9]{64,}', resp.text)
+        if match:
+            return match.group(0)
+    return None
+
+def inspect_token(access_token):
+    """Get open_id from Garena token inspect endpoint (more reliable)."""
+    url = f"https://100067.connect.garena.com/oauth/token/inspect?token={access_token}"
+    headers = {'User-Agent': 'GarenaMSDK/4.0.19P9'}
     try:
-        response = requests.get(api_url, headers=headers, allow_redirects=True, timeout=10)
-        final_params = parse_qs(urlparse(response.url).query)
-        if 'access_token' in final_params:
-            return final_params['access_token'][0]
-        return None
-    except Exception:
-        return None
-
-def fetch_open_id(access_token):
-    try:
-        uid_url = "https://prod-api.reward.ff.garena.com/redemption/api/auth/inspect_token/"
-        uid_headers = {
-            "authority": "prod-api.reward.ff.garena.com",
-            "method": "GET",
-            "path": "/redemption/api/auth/inspect_token/",
-            "scheme": "https",
-            "accept": "application/json, text/plain, */*",
-            "accept-encoding": "gzip, deflate, br",
-            "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-            "access-token": access_token,
-            "cookie": "_gid=GA1.2.444482899.1724033242; _ga_XB5PSHEQB4=GS1.1.1724040177.1.1.1724040732.0.0.0; token_session=cb73a97aaef2f1c7fd138757dc28a08f92904b1062e66c; _ga_KE3SY7MRSD=GS1.1.1724041788.0.0.1724041788.0; _ga_RF9R6YT614=GS1.1.1724041788.0.0.1724041788.0; _ga=GA1.1.1843180339.1724033241; apple_state_key=817771465df611ef8ab00ac8aa985783; _ga_G8QGMJPWWV=GS1.1.1724049483.1.1.1724049880.0.0; datadome=HBTqAUPVsbBJaOLirZCUkN3rXjf4gRnrZcNlw2WXTg7bn083SPey8X~ffVwr7qhtg8154634Ee9qq4bCkizBuiMZ3Qtqyf3Isxmsz6GTH_b6LMCKWF4Uea_HSPk;",
-            "origin": "https://reward.ff.garena.com",
-            "referer": "https://reward.ff.garena.com/",
-            "sec-ch-ua": '"Not.A/Brand";v="99", "Chromium";v="124"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Android"',
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-site",
-            "user-agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        }
-        uid_res = requests.get(uid_url, headers=uid_headers, verify=False, timeout=10)
-        uid_data = uid_res.json()
-        uid = uid_data.get("uid")
-
-        if not uid:
-            return None, "Failed to extract UID from token"
-
-        openid_url = "https://topup.pk/api/auth/player_id_login"
-        openid_headers = { 
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Encoding": "gzip, deflate, br, zstd",
-            "Accept-Language": "en-MM,en-US;q=0.9,en;q=0.8",
-            "Content-Type": "application/json",
-            "Origin": "https://topup.pk",
-            "Referer": "https://topup.pk/",
-            "sec-ch-ua": '"Not)A;Brand";v="8", "Chromium";v="138", "Android WebView";v="138"',
-            "sec-ch-ua-mobile": "?1",
-            "sec-ch-ua-platform": '"Android"',
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
-            "User-Agent": "Mozilla/5.0 (Linux; Android 15; RMX5070 Build/UKQ1.231108.001) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.7204.157 Mobile Safari/537.36",
-            "X-Requested-With": "mark.via.gp",
-            # UPDATED COOKIE FROM THE CLI WORKING SCRIPT TO BYPASS DATADOME
-            "Cookie": "source=mb; region=PK; mspid2=13c49fb51ece78886ebf7108a4907756; _fbp=fb.1.1753985808817.794945392376454660; language=en; datadome=WQaG3HalUB3PsGoSXY3TdcrSQextsSFwkOp1cqZtJ7Ax4YkiERHUgkgHlEAIccQO~w8dzTGM70D9SzaH7vymmEqOrVeX5pIsPVE22Uf3TDu6W3WG7j36ulnTg2DltRO7; session_key=hq02g63z3zjcumm76mafcooitj7nc79y",
-        }
-        payload = {"app_id": 100067, "login_id": str(uid)}
-        openid_res = requests.post(openid_url, headers=openid_headers, json=payload, verify=False, timeout=10)
-        openid_data = openid_res.json()
-        open_id = openid_data.get("open_id")
-
-        if not open_id:
-            return None, "Failed to extract open_id"
-
-        return open_id, None
-
-    except Exception as e:
-        return None, f"Exception occurred: {str(e)}"
-
+        resp = requests.get(url, headers=headers, verify=False, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get('open_id')
+    except:
+        pass
+    return None
 
 def internal_generate_jwt(access_token, open_id=None):
     if not open_id:
-        open_id, error = fetch_open_id(access_token)
-        if error:
-            return {"status": "error", "message": error}, 400
+        open_id = inspect_token(access_token)
+        if not open_id:
+            return {"status": "error", "message": "Failed to retrieve open_id from access token."}, 400
 
-    platforms = [8, 3, 4, 6]  
+    MAJOR_LOGIN_URL = "https://loginbp.ggblueshark.com/MajorLogin"  # working endpoint
 
-    for platform_type in platforms:
-        game_data = my_pb2.GameData()
-        game_data.timestamp = "2024-12-05 18:15:32"
-        game_data.game_name = "free fire"
-        game_data.game_version = 1
-        game_data.version_code = "1.108.3"
-        game_data.os_info = "Android OS 9 / API-28 (PI/rel.cjw.20220518.114133)"
-        game_data.device_type = "Handheld"
-        game_data.network_provider = "Verizon Wireless"
-        game_data.connection_type = "WIFI"
-        game_data.screen_width = 1280
-        game_data.screen_height = 960
-        game_data.dpi = "240"
-        game_data.cpu_info = "ARMv7 VFPv3 NEON VMH | 2400 | 4"
-        game_data.total_ram = 5951
-        game_data.gpu_name = "Adreno (TM) 640"
-        game_data.gpu_version = "OpenGL ES 3.0"
-        game_data.user_id = "Google|74b585a9-0268-4ad3-8f36-ef41d2e53610"
-        game_data.ip_address = "172.190.111.97"
-        game_data.language = "en"
-        game_data.open_id = open_id
-        game_data.access_token = access_token
-        game_data.platform_type = platform_type
-        game_data.field_99 = str(platform_type)
-        game_data.field_100 = str(platform_type)
-
-        serialized_data = game_data.SerializeToString()
-        encrypted_data = encrypt_message(serialized_data)
-
-        url = "https://loginbp.ggpolarbear.com/MajorLogin"
-        headers = {
-            "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
-            "Connection": "Keep-Alive",
-            "Accept-Encoding": "gzip",
-            "Content-Type": "application/octet-stream",
-            "Expect": "100-continue",
-            "X-Unity-Version": "2018.4.11f1",
-            "X-GA": "v1 1",
-            "ReleaseVersion": "OB54"
-        }
-
+    # Try platforms 1 through 9 (inclusive)
+    for platform_type in range(1, 10):
         try:
-            response = requests.post(url, data=encrypted_data, headers=headers, verify=False, timeout=5)
+            game_data = my_pb2.GameData()
+            game_data.timestamp = "2024-12-05 18:15:32"
+            game_data.game_name = "free fire"
+            game_data.game_version = 1
+            game_data.version_code = "1.108.3"
+            game_data.os_info = "Android OS 9 / API-28 (PI/rel.cjw.20220518.114133)"
+            game_data.device_type = "Handheld"
+            game_data.network_provider = "Verizon Wireless"
+            game_data.connection_type = "WIFI"
+            game_data.screen_width = 1280
+            game_data.screen_height = 960
+            game_data.dpi = "240"
+            game_data.cpu_info = "ARMv7 VFPv3 NEON VMH | 2400 | 4"
+            game_data.total_ram = 5951
+            game_data.gpu_name = "Adreno (TM) 640"
+            game_data.gpu_version = "OpenGL ES 3.0"
+            game_data.user_id = "Google|74b585a9-0268-4ad3-8f36-ef41d2e53610"
+            game_data.ip_address = "172.190.111.97"
+            game_data.language = "en"
+            game_data.open_id = open_id
+            game_data.access_token = access_token
+            game_data.platform_type = platform_type
+            game_data.field_99 = str(platform_type)
+            game_data.field_100 = str(platform_type)
+
+            serialized_data = game_data.SerializeToString()
+            encrypted_data = encrypt_message(serialized_data)
+
+            headers = {
+                "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
+                "Connection": "Keep-Alive",
+                "Accept-Encoding": "gzip",
+                "Content-Type": "application/octet-stream",
+                "Expect": "100-continue",
+                "X-Unity-Version": "2018.4.11f1",
+                "X-GA": "v1 1",
+                "ReleaseVersion": "OB54"
+            }
+
+            response = requests.post(MAJOR_LOGIN_URL, data=encrypted_data, headers=headers, verify=False, timeout=5)
             if response.status_code == 200:
+                # Decrypt the response (important!)
+                decrypted_data = decrypt_message(response.content)
+
+                # Try protobuf parsing
                 try:
                     example_msg = output_pb2.Garena_420()
-                    example_msg.ParseFromString(response.content)
-                    
+                    example_msg.ParseFromString(decrypted_data)
                     token_value = getattr(example_msg, "token", None)
-                    if token_value:
-                        
-                        try:
-                            decoded_token = jwt.decode(token_value, options={"verify_signature": False})
-                        except AttributeError:
-                            payload_b64 = token_value.split('.')[1]
-                            payload_b64 += "=" * ((4 - len(payload_b64) % 4) % 4)
-                            decoded_token = json.loads(base64.urlsafe_b64decode(payload_b64).decode('utf-8'))
-                            
-                        p_id = decoded_token.get("external_type")
-                        p_name = PLATFORM_MAP.get(p_id, f"Unknown ({p_id})")
-                        raw_nickname = decoded_token.get("nickname", "")
-                        
-                        account_name = decode_ff_name(raw_nickname)
-                        if "Error decoding" in account_name or not account_name:
-                            import urllib.parse
-                            account_name = urllib.parse.unquote(raw_nickname)
-                        
-                        result = {
-                            "access_token": access_token,
-                            "account_id": decoded_token.get("account_id"),
-                            "account_name": account_name,
-                            "open_id": open_id,
-                            "platform": p_name, 
-                            "region": decoded_token.get("lock_region"),
-                            "status": "success",
-                            "token": token_value
-                        }
-                        return result, 200
-                except Exception as e:
-                    continue 
-        except requests.RequestException:
-            continue  
+                except:
+                    token_value = None
+
+                # If token not found, fallback to text search
+                if not token_value:
+                    text = decrypted_data.decode('utf-8', errors='ignore')
+                    start = text.find("eyJ")
+                    if start != -1:
+                        end = start
+                        while end < len(text) and text[end] not in ['"', ' ', '\n', '\r', '\t', '\x00']:
+                            end += 1
+                        token_value = text[start:end]
+                        if token_value.count('.') < 2:
+                            token_value = None
+
+                if token_value:
+                    # Decode JWT (without verification)
+                    try:
+                        decoded_token = jwt.decode(token_value, options={"verify_signature": False})
+                    except AttributeError:
+                        payload_b64 = token_value.split('.')[1]
+                        payload_b64 += "=" * ((4 - len(payload_b64) % 4) % 4)
+                        decoded_token = json.loads(base64.urlsafe_b64decode(payload_b64).decode('utf-8'))
+
+                    p_id = decoded_token.get("external_type")
+                    p_name = PLATFORM_MAP.get(p_id, f"Unknown ({p_id})")
+                    raw_nickname = decoded_token.get("nickname", "")
+                    account_name = decode_ff_name(raw_nickname)
+                    if "Error decoding" in account_name or not account_name:
+                        account_name = requests.utils.unquote(raw_nickname)
+
+                    result = {
+                        "access_token": access_token,
+                        "account_id": decoded_token.get("account_id"),
+                        "account_name": account_name,
+                        "open_id": open_id,
+                        "platform": p_name,
+                        "region": decoded_token.get("lock_region"),
+                        "status": "success",
+                        "token": token_value
+                    }
+                    return result, 200
+        except Exception as e:
+            # silently continue to next platform
+            pass
+        time.sleep(0.1)
 
     return {"status": "error", "message": "No valid platform found or all authentication attempts failed."}, 400
 
@@ -267,7 +277,7 @@ def api_docs():
         "message": "Welcome to the FF JWT Generator API. This API allows you to extract Decoded Account Names, Details, and JWT Tokens.",
         "endpoints": {
             "/guest": {
-                "methods":["GET", "POST"],
+                "methods": ["GET", "POST"],
                 "description": "Generate JWT using Free Fire Guest Login credentials.",
                 "parameters": {
                     "uid": "String (Required) - The Guest Account UID",
@@ -327,7 +337,6 @@ def api_docs():
 @app.route('/token', methods=['GET', 'POST'])
 def token_endpoint():
     access_token = get_request_param('access_token')
-    
     if not access_token or access_token.strip() == "":
         return jsonify({
             "status": "error",
@@ -340,7 +349,6 @@ def token_endpoint():
 
     result, status_code = internal_generate_jwt(access_token)
     return jsonify(result), status_code
-
 
 @app.route('/guest', methods=['GET', 'POST'])
 def guest_endpoint():
@@ -392,7 +400,7 @@ def guest_endpoint():
 
     if 'access_token' not in oauth_data or 'open_id' not in oauth_data:
         return jsonify({
-            "status": "error", 
+            "status": "error",
             "message": "OAuth response missing access_token or open_id",
             "details": oauth_data
         }), 500
@@ -400,11 +408,9 @@ def guest_endpoint():
     result, status_code = internal_generate_jwt(oauth_data['access_token'], oauth_data['open_id'])
     return jsonify(result), status_code
 
-
 @app.route('/eat', methods=['GET', 'POST'])
 def eat_endpoint():
     eat_input = get_request_param('eat_token')
-    
     if not eat_input or eat_input.strip() == "":
         return jsonify({
             "status": "error",
@@ -425,7 +431,6 @@ def eat_endpoint():
 
     result, status_code = internal_generate_jwt(access_token)
     return jsonify(result), status_code
-
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=1080, debug=False)
