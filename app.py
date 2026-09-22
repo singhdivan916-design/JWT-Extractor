@@ -3,16 +3,10 @@
 """
 FF Guest → JWT — Production-grade, ultra-fast, never-fail Flask API.
 
-Changes vs previous version:
-  • FIXED: _Noop now implements dec() and info(); every metrics call is
-           wrapped so a metrics failure can never block a semaphore release.
-  • FIXED: semaphore release happens BEFORE metrics decrement.
-  • FIXED: the JWT race now launches ALL (endpoint × header × platform)
-           combinations in parallel — single wave, first success wins.
-           No more sequential waves.
-  • FIXED: dedicated per-attempt race timeout so a hung endpoint cannot
-           hold a pool thread for the full user-facing timeout.
-  • No rate limiting, no user-facing 429/503.
+Rule for lock_region → bucket:
+  • Known alias in REGION_ALIASES → that bucket
+  • UNKNOWN lock_region value    → OTHERS bucket (clientbp.ppmainecoonghj.com)
+  • MISSING lock_region (None)   → use caller's region param, else DEFAULT_REGION
 """
 
 import os
@@ -88,13 +82,12 @@ _TO_C = _env_float("FF_TO_CONNECT", 15.0)
 _TO_R = _env_float("FF_TO_READ", 120.0)
 TIMEOUT_OAUTH = (_TO_C, _TO_R)
 
-# Per-attempt race timeout — short, so a hung endpoint fails fast and
-# lets another combo win. This does NOT cap the user-facing request.
+# Per-attempt race timeout
 RACE_TO_C = _env_float("FF_RACE_CONNECT", 5.0)
 RACE_TO_R = _env_float("FF_RACE_READ", 12.0)
 TIMEOUT_RACE = (RACE_TO_C, RACE_TO_R)
 
-# Platform order (most likely to succeed first)
+# Platform order
 PLATFORM_TYPES = (4, 3, 8, 6, 5, 11, 13, 1, 2, 7, 9)
 GLOBAL_JWT_TIMEOUT = _env_float("FF_JWT_DEADLINE", 60.0)
 
@@ -102,7 +95,7 @@ GLOBAL_JWT_TIMEOUT = _env_float("FF_JWT_DEADLINE", 60.0)
 JWT_CACHE_TTL = _env_int("FF_CACHE_TTL", 300)
 JWT_CACHE_MAX = _env_int("FF_CACHE_MAX", 50000)
 
-# Bulkheads (high — practically never fire)
+# Bulkheads
 GLOBAL_CONCURRENCY       = _env_int("FF_GLOBAL_CONC", 4000)
 PER_ENDPOINT_CONCURRENCY = _env_int("FF_EP_CONC", 1000)
 OAuth_CONCURRENCY        = _env_int("FF_OAUTH_CONC", 1000)
@@ -117,7 +110,7 @@ LOG_LEVEL = os.environ.get("FF_LOG_LEVEL", "INFO").upper()
 
 
 # ==================================================================
-# REGIONS
+# REGION BUCKETS
 # ==================================================================
 REGION_BUCKETS = {
     "IND":     {"client_url": "https://client.ind.freefiremobile.com/",
@@ -127,32 +120,140 @@ REGION_BUCKETS = {
     "OTHERS":  {"client_url": "https://clientbp.ppmainecoonghj.com/",
                 "release_version": "OB55", "client_version": "1.132.7"},
 }
-REGION_ALIASES = {
-    "IND":"IND","INDIA":"IND","IN":"IND",
-    "AMERICA":"AMERICA","BR":"AMERICA","BRAZIL":"AMERICA","NA":"AMERICA",
-    "US":"AMERICA","USA":"AMERICA","USNA":"AMERICA","LATAM":"AMERICA",
-    "MX":"AMERICA","AR":"AMERICA","CO":"AMERICA",
-    "OTHERS":"OTHERS","OTHER":"OTHERS","REST":"OTHERS","ROW":"OTHERS",
-    "GLOBAL":"OTHERS","ME":"OTHERS","VN":"OTHERS","BD":"OTHERS","PK":"OTHERS",
-    "SG":"OTHERS","ID":"OTHERS","RU":"OTHERS","TH":"OTHERS","MY":"OTHERS",
-    "PH":"OTHERS","EG":"OTHERS","SA":"OTHERS","AE":"OTHERS",
-}
-DEFAULT_REGION = "IND"
 
+# ==================================================================
+# LOCK_REGION → BUCKET ALIASES
+#   Complete mapping. Anything NOT listed here → OTHERS bucket.
+# ==================================================================
+REGION_ALIASES = {
+    # ── IND bucket ──────────────────────────────────────
+    "IND":     "IND",
+    "INDIA":   "IND",
+    "IN":      "IND",
+
+    # ── AMERICA bucket ──────────────────────────────────
+    "AMERICA": "AMERICA",
+    "BR":      "AMERICA",
+    "BRAZIL":  "AMERICA",
+    "NA":      "AMERICA",
+    "US":      "AMERICA",
+    "USA":     "AMERICA",
+    "USNA":    "AMERICA",
+    "LATAM":   "AMERICA",
+    "MX":      "AMERICA",
+    "AR":      "AMERICA",
+    "CO":      "AMERICA",
+    "SAC":     "AMERICA",
+
+    # ── OTHERS bucket (SEA + Global) ────────────────────
+    "OTHERS":  "OTHERS",
+    "OTHER":   "OTHERS",
+    "REST":    "OTHERS",
+    "ROW":     "OTHERS",
+    "GLOBAL":  "OTHERS",
+    "ME":      "OTHERS",
+    "VN":      "OTHERS",
+    "BD":      "OTHERS",
+    "PK":      "OTHERS",
+    "SG":      "OTHERS",
+    "ID":      "OTHERS",
+    "RU":      "OTHERS",
+    "TH":      "OTHERS",
+    "TW":      "OTHERS",
+    "MY":      "OTHERS",
+    "PH":      "OTHERS",
+    "EG":      "OTHERS",
+    "SA":      "OTHERS",
+    "AE":      "OTHERS",
+    "CIS":     "OTHERS",
+    "EU":      "OTHERS",
+    "EUROPE":  "OTHERS",
+    "HK":      "OTHERS",
+    "MO":      "OTHERS",
+    "KH":      "OTHERS",
+    "MM":      "OTHERS",
+    "LA":      "OTHERS",
+    "NP":      "OTHERS",
+    "LK":      "OTHERS",
+    "QA":      "OTHERS",
+    "KW":      "OTHERS",
+    "BH":      "OTHERS",
+    "OM":      "OTHERS",
+    "JO":      "OTHERS",
+    "LB":      "OTHERS",
+    "IQ":      "OTHERS",
+    "IR":      "OTHERS",
+    "TR":      "OTHERS",
+    "KZ":      "OTHERS",
+    "UZ":      "OTHERS",
+    "UA":      "OTHERS",
+    "BY":      "OTHERS",
+    "JP":      "OTHERS",
+    "KR":      "OTHERS",
+    "AU":      "OTHERS",
+    "NZ":      "OTHERS",
+}
+
+DEFAULT_REGION = "IND"
+UNKNOWN_BUCKET = "OTHERS"   # any unknown lock_region lands here
+
+# ==================================================================
+# RESOLVERS
+# ==================================================================
 def _resolve_bucket(region):
-    if not region: return DEFAULT_REGION
+    """Resolve a caller-supplied region param to a bucket.
+    Unknown → DEFAULT_REGION (IND) so the *hint* stays safe."""
+    if not region:
+        return DEFAULT_REGION
     return REGION_ALIASES.get(str(region).strip().upper(), DEFAULT_REGION)
 
-def _bucket_cfg(b): return REGION_BUCKETS[b]
+def _bucket_cfg(b):
+    return REGION_BUCKETS[b]
 
-def _bucket_from_lock_region(raw, fallback):
-    if raw:
-        k = str(raw).strip().upper()
-        if k in REGION_ALIASES:
-            return REGION_ALIASES[k], "lock_region"
-    if fallback in REGION_BUCKETS:
-        return fallback, "request"
+def _bucket_from_lock_region(raw_lock_region, fallback_bucket):
+    """
+    Returns (bucket, source).
+
+    Priority:
+      1. raw_lock_region is a known alias       → that bucket, source="lock_region"
+      2. raw_lock_region is present but UNKNOWN → OTHERS bucket, source="lock_region_unknown"
+      3. raw_lock_region is missing (None/"")   → fallback_bucket, source="request"
+      4. everything else                        → DEFAULT_REGION, source="default"
+    """
+    # Cases 1 & 2: lock_region is present
+    if raw_lock_region is not None and str(raw_lock_region).strip() != "":
+        key = str(raw_lock_region).strip().upper()
+        bucket = REGION_ALIASES.get(key)
+        if bucket is not None:
+            return bucket, "lock_region"
+        # Unknown lock_region → always OTHERS
+        return UNKNOWN_BUCKET, "lock_region_unknown"
+
+    # Case 3: lock_region missing — trust caller's region param
+    if fallback_bucket in REGION_BUCKETS:
+        return fallback_bucket, "request"
+
+    # Case 4: default
     return DEFAULT_REGION, "default"
+
+
+# ==================================================================
+# STARTUP SANITY CHECK
+# ==================================================================
+_KNOWN_LOCK_REGIONS = {
+    "IND","BR","NA","US","USA","SAC","ME","VN","BD","PK","SG","ID","RU",
+    "TH","TW","MY","PH","EG","SA","AE","CIS","EU","EUROPE","HK","MO",
+    "KH","MM","LA","NP","LK","QA","KW","BH","OM","JO","LB","IQ","IR",
+    "TR","KZ","UZ","UA","BY","JP","KR","AU","NZ","MX","AR","CO","LATAM",
+    "INDIA","IN","BRAZIL","USNA",
+}
+_missing = _KNOWN_LOCK_REGIONS - set(REGION_ALIASES.keys())
+if _missing:
+    import warnings
+    warnings.warn(
+        f"REGION_ALIASES is missing these known lock_regions: "
+        f"{sorted(_missing)} — they will fall back to OTHERS bucket"
+    )
 
 
 # ==================================================================
@@ -177,15 +278,12 @@ logger.propagate = False
 
 
 # ==================================================================
-# METRICS  — no-op fallback fully implements the full API
+# METRICS  (no-op fallback implements full API)
 # ==================================================================
 class _Noop:
-    """No-op metrics object. Implements EVERY method prometheus_client
-    exposes (including dec) so a missing dependency can NEVER crash the
-    request path."""
     def labels(self, *a, **k): return self
     def inc(self, *a, **k): return self
-    def dec(self, *a, **k): return self      # ← the missing method
+    def dec(self, *a, **k): return self
     def observe(self, *a, **k): return self
     def set(self, *a, **k): return self
     def set_to_current_time(self, *a, **k): return self
@@ -217,8 +315,6 @@ else:
     M_SF_JOIN = M_OAUTH_FAIL = M_JWT_FAIL = _Noop()
     M_INFLIGHT = M_INFLIGHT_EP = M_CB_STATE = M_BULK_TIMEOUT = _Noop()
 
-# Every metrics call goes through these wrappers so a broken metrics
-# backend can never crash a request or skip a semaphore release.
 def _m_inc(m, *a, **k):
     try: m.inc(*a, **k)
     except Exception: pass
@@ -492,8 +588,6 @@ def _build_game_data(access_token, open_id, platform_type, cfg):
 
 # ==================================================================
 # SINGLE ATTEMPT
-#   CRITICAL: semaphore release happens FIRST in finally, then the
-#   metrics dec — so a metrics failure can never leak a permit.
 # ==================================================================
 def _attempt(access_token, open_id, platform_type, endpoint, header_kind, cfg):
     cb = _cb_for(endpoint)
@@ -516,13 +610,12 @@ def _attempt(access_token, open_id, platform_type, endpoint, header_kind, cfg):
     except Exception:
         cb.on_failure(); return None
     finally:
-        # Order matters: release resources first, then touch metrics.
         sem.release()
         _m_dec(M_INFLIGHT_EP.labels(endpoint))
 
 
 # ==================================================================
-# JWT RACE — single parallel wave, no sequential phases
+# JWT RACE — single parallel wave
 # ==================================================================
 FALLBACK_LOGIN_HOSTS = [
     "https://loginbp.ppmainecoonghj.com",
@@ -540,11 +633,6 @@ def _do_jwt_fetch(access_token, open_id, hint_bucket):
         if ep not in endpoints:
             endpoints.append(ep)
 
-    # Build all combinations ordered by likelihood:
-    #   primary + new      (all platforms)
-    #   primary + legacy   (top 6 platforms)
-    #   fallback1 + new    (top 6)
-    #   fallback2 + new    (top 6)
     combos = []
     for p in PLATFORM_TYPES:
         combos.append((endpoints[0], "new", p))
@@ -589,13 +677,11 @@ def _do_jwt_fetch(access_token, open_id, hint_bucket):
 
 
 def get_jwt(access_token, open_id, hint_bucket=DEFAULT_REGION):
-    # 1) cache
     cached = _jwt_cache.get(access_token)
     if cached is not None:
         _m_inc(M_CACHE_HIT); return cached
     _m_inc(M_CACHE_MISS)
 
-    # 2) singleflight
     ev, is_leader = _sf_acquire(access_token)
     if not is_leader:
         _m_inc(M_SF_JOIN)
@@ -662,7 +748,6 @@ def guest_to_token(uid, password):
             cb.on_failure()
             last_err = {"status": "error", "message": f"OAuth exception: {e}"}
         finally:
-            # Order matters — release first, then metrics (defensive).
             _oauth_sem.release()
     return None, last_err or {"status": "error", "message": "OAuth failed"}
 
@@ -701,7 +786,7 @@ def _after(resp):
 
 
 # ==================================================================
-# INFO
+# INFO ENDPOINTS
 # ==================================================================
 @app.route("/health", methods=["GET"])
 def health(): return jsonify({"status": "ok"}), 200
@@ -724,8 +809,9 @@ def root():
     return jsonify({
         "status": "ok", "service": "ff-jwt-guest",
         "buckets": list(REGION_BUCKETS.keys()),
+        "unknown_bucket": UNKNOWN_BUCKET,
         "default_region": DEFAULT_REGION,
-        "note": "addr is always derived from JWT lock_region",
+        "note": "addr derived from JWT lock_region; unknown lock_region → OTHERS",
         "endpoint": "/guest?uid=UID&password=PASSWORD",
     })
 
@@ -735,8 +821,12 @@ def regions():
     for b, cfg in REGION_BUCKETS.items():
         aliases = [a for a, x in REGION_ALIASES.items() if x == b]
         out[b] = {**cfg, "server_url": SERVER_URL, "aliases": aliases}
-    return jsonify({"status": "success", "default": DEFAULT_REGION,
-                    "regions": out})
+    return jsonify({
+        "status": "success",
+        "default": DEFAULT_REGION,
+        "unknown_bucket": UNKNOWN_BUCKET,
+        "regions": out,
+    })
 
 
 # ==================================================================
@@ -757,7 +847,7 @@ def _valid_input(uid, password):
 
 
 # ==================================================================
-# MAIN
+# MAIN ENDPOINT
 # ==================================================================
 @app.route("/guest", methods=["GET", "POST"])
 def guest_endpoint():
@@ -765,7 +855,7 @@ def guest_endpoint():
         return jsonify({
             "status": "error",
             "message": "Server under extreme load. Please retry.",
-            "addr": REGION_BUCKETS[DEFAULT_REGION]["client_url"],
+            "addr": REGION_BUCKETS[UNKNOWN_BUCKET]["client_url"],
         }), 200
 
     _m_inc(M_INFLIGHT)
@@ -830,6 +920,7 @@ def guest_endpoint():
                 "open_id": open_id,
             }), 502
 
+        # ---- derive final bucket from JWT lock_region ----
         p = _parse_jwt_payload(jwt_token)
         lock_region_raw = p.get("lock_region")
         final_bucket, region_source = _bucket_from_lock_region(lock_region_raw, hint_bucket)
@@ -858,15 +949,14 @@ def guest_endpoint():
             b = _resolve_bucket(region_hint_raw or DEFAULT_REGION)
             addr = _bucket_cfg(b)["client_url"]
         except Exception:
-            b = DEFAULT_REGION
-            addr = REGION_BUCKETS[DEFAULT_REGION]["client_url"]
+            b = UNKNOWN_BUCKET
+            addr = REGION_BUCKETS[UNKNOWN_BUCKET]["client_url"]
         return jsonify({
             "status": "error",
             "message": f"Unhandled: {type(e).__name__}: {e}",
             "addr": addr, "region": b, "region_source": "fallback",
         }), 200
     finally:
-        # ORDER MATTERS — release the semaphore first, then decrement metrics.
         _global_sem.release()
         _m_dec(M_INFLIGHT)
 
@@ -874,7 +964,7 @@ def guest_endpoint():
 # ==================================================================
 # ERROR HANDLERS
 # ==================================================================
-def _def_addr(): return REGION_BUCKETS[DEFAULT_REGION]["client_url"]
+def _def_addr(): return REGION_BUCKETS[UNKNOWN_BUCKET]["client_url"]
 
 @app.errorhandler(404)
 def _404(e): return jsonify({"status":"error","message":"Not found",
@@ -917,5 +1007,6 @@ except Exception: pass
 
 
 if __name__ == "__main__":
-    logger.info(f"starting host={LISTEN_HOST} port={LISTEN_PORT}")
+    logger.info(f"starting host={LISTEN_HOST} port={LISTEN_PORT} "
+                f"unknown_bucket={UNKNOWN_BUCKET}")
     app.run(host=LISTEN_HOST, port=LISTEN_PORT, debug=False, threaded=True)
