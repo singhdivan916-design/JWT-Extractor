@@ -3,9 +3,14 @@
 """
 FF Guest → JWT — Production-grade, ultra-fast, never-fail Flask API.
 
+Fixed configuration:
+  • Platform type: 4 (Guest) ONLY
+  • Login URL: https://loginbp.ppmainecoonghj.com/MajorLogin ONLY
+  • No fallback endpoints, no platform race — single POST per call
+
 Rule for lock_region → bucket:
   • Known alias in REGION_ALIASES → that bucket
-  • UNKNOWN lock_region value    → OTHERS bucket (clientbp.ppmainecoonghj.com)
+  • UNKNOWN lock_region value    → OTHERS bucket
   • MISSING lock_region (None)   → use caller's region param, else DEFAULT_REGION
 """
 
@@ -19,7 +24,6 @@ import signal
 import logging
 import threading
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime
 
 import requests
@@ -77,19 +81,19 @@ SERVER_URL  = os.environ.get("FF_SERVER_URL", "https://loginbp.ppmainecoonghj.co
 LISTEN_HOST = os.environ.get("FF_HOST", "0.0.0.0")
 LISTEN_PORT = _env_int("FF_PORT", 1080)
 
+# ---------- FIXED login endpoint + platform ----------
+LOGIN_ENDPOINT = f"{SERVER_URL.rstrip('/')}/MajorLogin"
+PLATFORM_TYPE  = 4                                     # Guest only
+
 # User-facing timeouts (generous)
 _TO_C = _env_float("FF_TO_CONNECT", 15.0)
 _TO_R = _env_float("FF_TO_READ", 120.0)
 TIMEOUT_OAUTH = (_TO_C, _TO_R)
 
-# Per-attempt race timeout
-RACE_TO_C = _env_float("FF_RACE_CONNECT", 5.0)
-RACE_TO_R = _env_float("FF_RACE_READ", 12.0)
-TIMEOUT_RACE = (RACE_TO_C, RACE_TO_R)
-
-# Platform order
-PLATFORM_TYPES = (4, 3, 8, 6, 5, 11, 13, 1, 2, 7, 9)
-GLOBAL_JWT_TIMEOUT = _env_float("FF_JWT_DEADLINE", 60.0)
+# Login attempt timeout — generous, no race, so it can be longer
+LOGIN_TO_C = _env_float("FF_LOGIN_CONNECT", 10.0)
+LOGIN_TO_R = _env_float("FF_LOGIN_READ", 60.0)
+TIMEOUT_LOGIN = (LOGIN_TO_C, LOGIN_TO_R)
 
 # Cache
 JWT_CACHE_TTL = _env_int("FF_CACHE_TTL", 300)
@@ -97,7 +101,7 @@ JWT_CACHE_MAX = _env_int("FF_CACHE_MAX", 50000)
 
 # Bulkheads
 GLOBAL_CONCURRENCY       = _env_int("FF_GLOBAL_CONC", 4000)
-PER_ENDPOINT_CONCURRENCY = _env_int("FF_EP_CONC", 1000)
+LOGIN_CONCURRENCY        = _env_int("FF_LOGIN_CONC", 2000)
 OAuth_CONCURRENCY        = _env_int("FF_OAUTH_CONC", 1000)
 BULKHEAD_WAIT            = _env_float("FF_BULKHEAD_WAIT", 60.0)
 
@@ -123,86 +127,41 @@ REGION_BUCKETS = {
 
 # ==================================================================
 # LOCK_REGION → BUCKET ALIASES
-#   Complete mapping. Anything NOT listed here → OTHERS bucket.
+#   Anything NOT listed here → OTHERS bucket
 # ==================================================================
 REGION_ALIASES = {
-    # ── IND bucket ──────────────────────────────────────
-    "IND":     "IND",
-    "INDIA":   "IND",
-    "IN":      "IND",
+    # IND
+    "IND": "IND", "INDIA": "IND", "IN": "IND",
 
-    # ── AMERICA bucket ──────────────────────────────────
-    "AMERICA": "AMERICA",
-    "BR":      "AMERICA",
-    "BRAZIL":  "AMERICA",
-    "NA":      "AMERICA",
-    "US":      "AMERICA",
-    "USA":     "AMERICA",
-    "USNA":    "AMERICA",
-    "LATAM":   "AMERICA",
-    "MX":      "AMERICA",
-    "AR":      "AMERICA",
-    "CO":      "AMERICA",
-    "SAC":     "AMERICA",
+    # AMERICA
+    "AMERICA": "AMERICA", "BR": "AMERICA", "BRAZIL": "AMERICA",
+    "NA": "AMERICA", "US": "AMERICA", "USA": "AMERICA", "USNA": "AMERICA",
+    "LATAM": "AMERICA", "MX": "AMERICA", "AR": "AMERICA",
+    "CO": "AMERICA", "SAC": "AMERICA",
 
-    # ── OTHERS bucket (SEA + Global) ────────────────────
-    "OTHERS":  "OTHERS",
-    "OTHER":   "OTHERS",
-    "REST":    "OTHERS",
-    "ROW":     "OTHERS",
-    "GLOBAL":  "OTHERS",
-    "ME":      "OTHERS",
-    "VN":      "OTHERS",
-    "BD":      "OTHERS",
-    "PK":      "OTHERS",
-    "SG":      "OTHERS",
-    "ID":      "OTHERS",
-    "RU":      "OTHERS",
-    "TH":      "OTHERS",
-    "TW":      "OTHERS",
-    "MY":      "OTHERS",
-    "PH":      "OTHERS",
-    "EG":      "OTHERS",
-    "SA":      "OTHERS",
-    "AE":      "OTHERS",
-    "CIS":     "OTHERS",
-    "EU":      "OTHERS",
-    "EUROPE":  "OTHERS",
-    "HK":      "OTHERS",
-    "MO":      "OTHERS",
-    "KH":      "OTHERS",
-    "MM":      "OTHERS",
-    "LA":      "OTHERS",
-    "NP":      "OTHERS",
-    "LK":      "OTHERS",
-    "QA":      "OTHERS",
-    "KW":      "OTHERS",
-    "BH":      "OTHERS",
-    "OM":      "OTHERS",
-    "JO":      "OTHERS",
-    "LB":      "OTHERS",
-    "IQ":      "OTHERS",
-    "IR":      "OTHERS",
-    "TR":      "OTHERS",
-    "KZ":      "OTHERS",
-    "UZ":      "OTHERS",
-    "UA":      "OTHERS",
-    "BY":      "OTHERS",
-    "JP":      "OTHERS",
-    "KR":      "OTHERS",
-    "AU":      "OTHERS",
-    "NZ":      "OTHERS",
+    # OTHERS
+    "OTHERS": "OTHERS", "OTHER": "OTHERS", "REST": "OTHERS", "ROW": "OTHERS",
+    "GLOBAL": "OTHERS", "ME": "OTHERS", "VN": "OTHERS", "BD": "OTHERS",
+    "PK": "OTHERS", "SG": "OTHERS", "ID": "OTHERS", "RU": "OTHERS",
+    "TH": "OTHERS", "TW": "OTHERS", "MY": "OTHERS", "PH": "OTHERS",
+    "EG": "OTHERS", "SA": "OTHERS", "AE": "OTHERS", "CIS": "OTHERS",
+    "EU": "OTHERS", "EUROPE": "OTHERS", "HK": "OTHERS", "MO": "OTHERS",
+    "KH": "OTHERS", "MM": "OTHERS", "LA": "OTHERS", "NP": "OTHERS",
+    "LK": "OTHERS", "QA": "OTHERS", "KW": "OTHERS", "BH": "OTHERS",
+    "OM": "OTHERS", "JO": "OTHERS", "LB": "OTHERS", "IQ": "OTHERS",
+    "IR": "OTHERS", "TR": "OTHERS", "KZ": "OTHERS", "UZ": "OTHERS",
+    "UA": "OTHERS", "BY": "OTHERS", "JP": "OTHERS", "KR": "OTHERS",
+    "AU": "OTHERS", "NZ": "OTHERS",
 }
 
 DEFAULT_REGION = "IND"
-UNKNOWN_BUCKET = "OTHERS"   # any unknown lock_region lands here
+UNKNOWN_BUCKET = "OTHERS"
+
 
 # ==================================================================
 # RESOLVERS
 # ==================================================================
 def _resolve_bucket(region):
-    """Resolve a caller-supplied region param to a bucket.
-    Unknown → DEFAULT_REGION (IND) so the *hint* stays safe."""
     if not region:
         return DEFAULT_REGION
     return REGION_ALIASES.get(str(region).strip().upper(), DEFAULT_REGION)
@@ -213,27 +172,19 @@ def _bucket_cfg(b):
 def _bucket_from_lock_region(raw_lock_region, fallback_bucket):
     """
     Returns (bucket, source).
-
-    Priority:
-      1. raw_lock_region is a known alias       → that bucket, source="lock_region"
-      2. raw_lock_region is present but UNKNOWN → OTHERS bucket, source="lock_region_unknown"
-      3. raw_lock_region is missing (None/"")   → fallback_bucket, source="request"
-      4. everything else                        → DEFAULT_REGION, source="default"
+      1. known lock_region       → that bucket,         source="lock_region"
+      2. unknown lock_region     → OTHERS bucket,       source="lock_region_unknown"
+      3. no lock_region          → fallback_bucket,     source="request"
+      4. nothing                 → DEFAULT_REGION,      source="default"
     """
-    # Cases 1 & 2: lock_region is present
     if raw_lock_region is not None and str(raw_lock_region).strip() != "":
         key = str(raw_lock_region).strip().upper()
         bucket = REGION_ALIASES.get(key)
         if bucket is not None:
             return bucket, "lock_region"
-        # Unknown lock_region → always OTHERS
         return UNKNOWN_BUCKET, "lock_region_unknown"
-
-    # Case 3: lock_region missing — trust caller's region param
     if fallback_bucket in REGION_BUCKETS:
         return fallback_bucket, "request"
-
-    # Case 4: default
     return DEFAULT_REGION, "default"
 
 
@@ -278,7 +229,7 @@ logger.propagate = False
 
 
 # ==================================================================
-# METRICS  (no-op fallback implements full API)
+# METRICS
 # ==================================================================
 class _Noop:
     def labels(self, *a, **k): return self
@@ -302,18 +253,16 @@ if _HAS_PROM:
     M_CACHE_MISS   = Counter("ff_cache_misses_total", "JWT cache misses")
     M_SF_JOIN      = Counter("ff_singleflight_joins_total", "Singleflight joins")
     M_OAUTH_FAIL   = Counter("ff_oauth_failures_total", "OAuth failures")
-    M_JWT_FAIL     = Counter("ff_jwt_failures_total", "JWT race failures")
+    M_JWT_FAIL     = Counter("ff_jwt_failures_total", "JWT failures")
     M_INFLIGHT     = Gauge("ff_inflight_requests", "In-flight requests")
-    M_INFLIGHT_EP  = Gauge("ff_inflight_endpoint", "In-flight per endpoint",
-                           ["endpoint"])
-    M_CB_STATE     = Gauge("ff_circuit_state", "Circuit state 0=closed 1=half 2=open",
+    M_CB_STATE     = Gauge("ff_circuit_state", "Circuit state",
                            ["endpoint"])
     M_BULK_TIMEOUT = Counter("ff_bulkhead_timeouts_total", "Bulkhead timeouts",
                              ["kind"])
 else:
     M_REQ = M_REQ_MS = M_CACHE_HIT = M_CACHE_MISS = _Noop()
     M_SF_JOIN = M_OAUTH_FAIL = M_JWT_FAIL = _Noop()
-    M_INFLIGHT = M_INFLIGHT_EP = M_CB_STATE = M_BULK_TIMEOUT = _Noop()
+    M_INFLIGHT = M_CB_STATE = M_BULK_TIMEOUT = _Noop()
 
 def _m_inc(m, *a, **k):
     try: m.inc(*a, **k)
@@ -331,18 +280,9 @@ def _m_obs(m, v, *a, **k):
 # ==================================================================
 # BULKHEADS
 # ==================================================================
-_global_sem   = threading.BoundedSemaphore(GLOBAL_CONCURRENCY)
-_oauth_sem    = threading.BoundedSemaphore(OAuth_CONCURRENCY)
-_ep_sems_lock = threading.Lock()
-_ep_sems      = {}
-
-def _ep_sem(endpoint):
-    with _ep_sems_lock:
-        s = _ep_sems.get(endpoint)
-        if s is None:
-            s = threading.BoundedSemaphore(PER_ENDPOINT_CONCURRENCY)
-            _ep_sems[endpoint] = s
-        return s
+_global_sem = threading.BoundedSemaphore(GLOBAL_CONCURRENCY)
+_login_sem  = threading.BoundedSemaphore(LOGIN_CONCURRENCY)
+_oauth_sem  = threading.BoundedSemaphore(OAuth_CONCURRENCY)
 
 def _acquire(sem, kind):
     ok = sem.acquire(timeout=BULKHEAD_WAIT)
@@ -508,15 +448,6 @@ def _new_headers(cfg):
         "X-Unity-Version": "2018.4.12f1", "Connection": "Keep-Alive",
     }
 
-def _legacy_headers(cfg):
-    return {
-        "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
-        "Connection": "Keep-Alive", "Accept-Encoding": "gzip",
-        "Content-Type": "application/octet-stream",
-        "Expect": "100-continue", "X-Unity-Version": "2018.4.11f1",
-        "X-GA": "v1 1", "ReleaseVersion": cfg["release_version"],
-    }
-
 OAUTH_HEADERS = {
     "User-Agent": "GarenaMSDK/4.0.19P9(SM-M526B ;Android 13;pt;BR;)",
     "Connection": "Keep-Alive", "Accept-Encoding": "gzip",
@@ -556,9 +487,9 @@ def _parse_jwt_payload(tok):
 
 
 # ==================================================================
-# GAME DATA
+# GAME DATA (platform hardcoded to 4)
 # ==================================================================
-def _build_game_data(access_token, open_id, platform_type, cfg):
+def _build_game_data(access_token, open_id, cfg):
     g = my_pb2.GameData()
     g.timestamp        = time.strftime("%Y-%m-%d %H:%M:%S")
     g.game_name        = "free fire"
@@ -580,26 +511,28 @@ def _build_game_data(access_token, open_id, platform_type, cfg):
     g.language         = "en"
     g.open_id          = open_id
     g.access_token     = access_token
-    g.platform_type    = platform_type
-    g.field_99         = str(platform_type)
-    g.field_100        = str(platform_type)
+    g.platform_type    = PLATFORM_TYPE
+    g.field_99         = str(PLATFORM_TYPE)
+    g.field_100        = str(PLATFORM_TYPE)
     return g
 
 
 # ==================================================================
-# SINGLE ATTEMPT
+# SINGLE LOGIN ATTEMPT  (fixed endpoint + fixed platform)
 # ==================================================================
-def _attempt(access_token, open_id, platform_type, endpoint, header_kind, cfg):
-    cb = _cb_for(endpoint)
-    if not cb.allow(): return None
-    sem = _ep_sem(endpoint)
-    if not _acquire(sem, "endpoint"): return None
-    _m_inc(M_INFLIGHT_EP.labels(endpoint))
+def _login_once(access_token, open_id, cfg):
+    """One POST to the fixed endpoint. Returns JWT or None."""
+    cb = _cb_for(LOGIN_ENDPOINT)
+    if not cb.allow():
+        return None
+    if not _acquire(_login_sem, "login"):
+        return None
     try:
-        g = _build_game_data(access_token, open_id, platform_type, cfg)
+        g = _build_game_data(access_token, open_id, cfg)
         enc = encrypt_message(g.SerializeToString())
-        hdrs = _new_headers(cfg) if header_kind == "new" else _legacy_headers(cfg)
-        r = get_session().post(endpoint, data=enc, headers=hdrs, timeout=TIMEOUT_RACE)
+        hdrs = _new_headers(cfg)
+        r = get_session().post(LOGIN_ENDPOINT, data=enc, headers=hdrs,
+                               timeout=TIMEOUT_LOGIN)
         if r.status_code != 200:
             cb.on_failure(); return None
         body = _strip_envelope(decrypt_message(r.content), r.headers)
@@ -610,82 +543,29 @@ def _attempt(access_token, open_id, platform_type, endpoint, header_kind, cfg):
     except Exception:
         cb.on_failure(); return None
     finally:
-        sem.release()
-        _m_dec(M_INFLIGHT_EP.labels(endpoint))
+        _login_sem.release()
 
 
 # ==================================================================
-# JWT RACE — single parallel wave
+# JWT FETCH
 # ==================================================================
-FALLBACK_LOGIN_HOSTS = [
-    "https://loginbp.ppmainecoonghj.com",
-    "https://loginbp.ggblueshark.com",
-    "https://loginbp.ggpolarbear.com",
-]
-
 def _do_jwt_fetch(access_token, open_id, hint_bucket):
     cfg = _bucket_cfg(hint_bucket)
-    deadline = time.monotonic() + GLOBAL_JWT_TIMEOUT
-
-    endpoints = [f"{SERVER_URL.rstrip('/')}/MajorLogin"]
-    for h in FALLBACK_LOGIN_HOSTS:
-        ep = f"{h}/MajorLogin"
-        if ep not in endpoints:
-            endpoints.append(ep)
-
-    combos = []
-    for p in PLATFORM_TYPES:
-        combos.append((endpoints[0], "new", p))
-    for p in PLATFORM_TYPES[:6]:
-        combos.append((endpoints[0], "legacy", p))
-    for ep in endpoints[1:]:
-        for p in PLATFORM_TYPES[:6]:
-            combos.append((ep, "new", p))
-
-    result_box  = [None]
-    result_lock = threading.Lock()
-    done_event  = threading.Event()
-
-    def _worker(ep, hk, platform):
-        if done_event.is_set(): return
-        tok = _attempt(access_token, open_id, platform, ep, hk, cfg)
-        if tok:
-            with result_lock:
-                if result_box[0] is None:
-                    result_box[0] = tok
-                    done_event.set()
-
-    max_workers = min(48, max(8, len(combos)))
-    pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="ff")
-    try:
-        futures = [pool.submit(_worker, ep, hk, p) for ep, hk, p in combos]
-        pending = set(futures)
-        while pending and result_box[0] is None:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0: break
-            try:
-                _, pending = wait(pending, timeout=min(remaining, 5.0),
-                                  return_when=FIRST_COMPLETED)
-            except Exception:
-                break
-        for f in pending:
-            f.cancel()
-    finally:
-        done_event.set()
-        pool.shutdown(wait=False)
-    return result_box[0]
+    return _login_once(access_token, open_id, cfg)
 
 
 def get_jwt(access_token, open_id, hint_bucket=DEFAULT_REGION):
+    # 1) cache
     cached = _jwt_cache.get(access_token)
     if cached is not None:
         _m_inc(M_CACHE_HIT); return cached
     _m_inc(M_CACHE_MISS)
 
+    # 2) singleflight — identical concurrent requests share one backend call
     ev, is_leader = _sf_acquire(access_token)
     if not is_leader:
         _m_inc(M_SF_JOIN)
-        ev.wait(GLOBAL_JWT_TIMEOUT + 10)
+        ev.wait(120)
         return _jwt_cache.get(access_token)
 
     try:
@@ -808,10 +688,12 @@ def metrics():
 def root():
     return jsonify({
         "status": "ok", "service": "ff-jwt-guest",
+        "login_endpoint": LOGIN_ENDPOINT,
+        "platform_type": PLATFORM_TYPE,
         "buckets": list(REGION_BUCKETS.keys()),
         "unknown_bucket": UNKNOWN_BUCKET,
         "default_region": DEFAULT_REGION,
-        "note": "addr derived from JWT lock_region; unknown lock_region → OTHERS",
+        "note": "addr derived from JWT lock_region; unknown → OTHERS",
         "endpoint": "/guest?uid=UID&password=PASSWORD",
     })
 
@@ -907,20 +789,20 @@ def guest_endpoint():
         access_token = oauth["access_token"]
         open_id = oauth["open_id"]
 
-        # ---- JWT race ----
+        # ---- Login (single POST, platform 4) ----
         jwt_token = get_jwt(access_token, open_id, hint_bucket)
         if not jwt_token:
             _m_inc(M_JWT_FAIL)
             return jsonify({
                 "status": "error",
-                "message": "All endpoints & platforms exhausted.",
+                "message": "Login endpoint rejected the request.",
                 "addr": hint_addr, "region": hint_bucket,
                 "region_source": "request",
                 "access_token": access_token,
                 "open_id": open_id,
             }), 502
 
-        # ---- derive final bucket from JWT lock_region ----
+        # ---- derive bucket from JWT lock_region ----
         p = _parse_jwt_payload(jwt_token)
         lock_region_raw = p.get("lock_region")
         final_bucket, region_source = _bucket_from_lock_region(lock_region_raw, hint_bucket)
@@ -988,7 +870,7 @@ def _any(e): return jsonify({"status":"error","message":str(e),
 # ==================================================================
 def _warmup():
     try:
-        for u in [OAUTH_URLS[0], SERVER_URL.rstrip("/")]:
+        for u in [OAUTH_URLS[0], LOGIN_ENDPOINT]:
             try: get_session().head(u, timeout=(5, 10))
             except Exception: pass
     except Exception: pass
@@ -1008,5 +890,5 @@ except Exception: pass
 
 if __name__ == "__main__":
     logger.info(f"starting host={LISTEN_HOST} port={LISTEN_PORT} "
-                f"unknown_bucket={UNKNOWN_BUCKET}")
+                f"login={LOGIN_ENDPOINT} platform={PLATFORM_TYPE}")
     app.run(host=LISTEN_HOST, port=LISTEN_PORT, debug=False, threaded=True)
